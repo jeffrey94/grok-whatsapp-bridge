@@ -11,6 +11,7 @@ import { GrokClient } from "./grok-client.js";
 import { createLogger } from "./logger.js";
 import { JsonStateStore } from "./state.js";
 import { InboundJournal } from "./journal.js";
+import { ChatBuffer } from "./core/chat-buffer.js";
 import { BaileysTransport, NeedsPairingError } from "./whatsapp/baileys-adapter.js";
 import { ensurePrivateDir } from "./whatsapp/secure-fs.js";
 import { StatusFile, TERMINAL_STATES } from "./whatsapp/status.js";
@@ -57,6 +58,8 @@ const state = new JsonStateStore(config.statePath);
 await state.load();
 // Write-ahead journal of accepted inbound messages (replayed after a crash/SIGTERM).
 const journal = new InboundJournal(path.join(path.dirname(config.statePath), "inbound-journal.json"), { log }).load();
+// Tag-mode groups: rolling buffer of unforwarded messages (mode 600, survives restarts).
+const chatBuffer = new ChatBuffer(path.join(path.dirname(config.statePath), "chat-buffer.json"), { log }).load();
 if (journal.size) log.warn(`Inbound journal has ${journal.size} unfinished message(s); replaying after connect`);
 const grok = new GrokClient(config.gatewayUrl, config.gatewayToken, {
   pollIntervalMs: config.pollIntervalMs,
@@ -107,7 +110,8 @@ const transport = new BaileysTransport({
     void bridge.runLateDelivery({ signal: shutdown.signal })
       .catch((error) => log.error(`Late delivery stopped: ${error.message}`));
     // Proactive posts requested on the box with scripts/nudge.mjs (groups with allowNudge only).
-    if (config.groups.some((group) => group.allowNudge)) {
+    // Always on: scheduled checks (allowNudge groups) and one-off admin prompts (scripts/admin-prompt.mjs).
+    {
       void runNudgeInbox(bridge, { dir: nudgeDir, signal: shutdown.signal, log })
         .catch((error) => log.error(`Nudge inbox stopped: ${error.message}`));
     }
@@ -121,6 +125,7 @@ bridge = new WhatsAppBridge({
   transport,
   log,
   journal,
+  chatBuffer,
   options: {
     silentTokens: config.silentTokens,
     maxMessageAgeSec: config.maxMessageAgeSec,

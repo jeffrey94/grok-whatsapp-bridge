@@ -15,12 +15,12 @@ import { GrokClient } from "../src/grok-client.js";
 import { JsonStateStore } from "../src/state.js";
 import { recordingLog, waitFor } from "./helpers/fake-baileys.js";
 
-const AGENT = "agent-pj";
+const AGENT = "agent-test";
 const OTHER_AGENT = "agent-other";
 const GROUP = "120363000000000021@g.us";
 const OTHER_GROUP = "120363000000000009@g.us";
 const OWNER = "60123456789@s.whatsapp.net";
-const SELF = "60111111111@s.whatsapp.net";
+const SELF = "10111111111@s.whatsapp.net";
 
 /** In-memory gateway. `status` is what listAgents reports for AGENT. */
 function fakeGateway() {
@@ -41,7 +41,7 @@ function fakeGateway() {
     },
   };
   const handlers = {
-    listAgents: () => ({ agents: [{ id: AGENT, name: "PJ", ...gw.status }, { id: OTHER_AGENT, name: "Other", isRunning: false }] }),
+    listAgents: () => ({ agents: [{ id: AGENT, name: "Test", ...gw.status }, { id: OTHER_AGENT, name: "Other", isRunning: false }] }),
     sendPrompt: (body) => {
       gw.prompts.push(body);
       gw.entries.push({ id: gw.id("u"), kind: "message", role: "user", clientNonce: body.clientNonce, content: body.prompt, timestampMs: Date.now() });
@@ -68,11 +68,11 @@ function fakeTransport() {
     sendText: async (chatId, text, options = {}) => { sent.push({ chatId, text, quoted: options.quoted?.key?.id }); return { id: `B${sent.length}` }; },
     sendFile: async (chatId, file) => { sent.push({ chatId, file: file.filename }); return { id: `B${sent.length}` }; },
     setTyping: async () => {},
-    chatName: () => "PJ Boys",
+    chatName: () => "Test Group",
   };
 }
 
-async function setup({ replyTimeoutMs = 5_000, groups, statePath, now } = {}) {
+async function setup({ replyTimeoutMs = 5_000, groups, statePath, now, extraOptions = {} } = {}) {
   const dir = statePath ? path.dirname(statePath) : mkdtempSync(path.join(tmpdir(), "wa-late-"));
   const gw = fakeGateway();
   const state = new JsonStateStore(statePath ?? path.join(dir, "bridge-state.json"));
@@ -81,7 +81,7 @@ async function setup({ replyTimeoutMs = 5_000, groups, statePath, now } = {}) {
     defaultAgent: OTHER_AGENT,
     dms: [{ id: OWNER, agent: AGENT }],
     groups: groups ?? [
-      { jid: GROUP, name: "PJ Boys", agent: AGENT, mode: "mention" },
+      { jid: GROUP, name: "Test Group", agent: AGENT, mode: "mention" },
       { jid: OTHER_GROUP, name: "Other", agent: OTHER_AGENT, mode: "mention" },
     ],
   });
@@ -90,7 +90,7 @@ async function setup({ replyTimeoutMs = 5_000, groups, statePath, now } = {}) {
   const grok = new GrokClient("http://127.0.0.1:1340", "t", { fetchImpl: gw.fetchImpl, pollIntervalMs: 10, replyTimeoutMs });
   const bridge = new WhatsAppBridge({
     grok, state, router, guard: new LoopGuard(), transport, log,
-    options: { sendDelayMs: 0, stableReplyMs: 40, lateDeliveryPollMs: 10, typingIndicator: false, ...(now ? { now } : {}) },
+    options: { sendDelayMs: 0, stableReplyMs: 40, lateDeliveryPollMs: 10, typingIndicator: false, ...(now ? { now } : {}), ...extraOptions },
   });
   return { dir, gw, state, bridge, transport, log, statePath: state.filename };
 }
@@ -103,7 +103,7 @@ function mention(text, chatId = GROUP) {
     chatId,
     sender: { jid: "123456789012345@lid" },
     kind: "text",
-    text: `@60111111111 ${text}`,
+    text: `@10111111111 ${text}`,
     mentionedJids: [SELF],
     timestamp: Math.floor(Date.now() / 1000),
     raw: { key: { id: `M${msgSeq}`, remoteJid: chatId } },
@@ -196,8 +196,8 @@ test("item 1: a timeout with nothing sent still posts the error notice", async (
   assert.deepEqual(texts(ctx), [ERROR_NOTICE]);
 });
 
-test("item 2 (eff): a finished turn is not followed: no transcript polls, and later unsolicited messages are not posted", async () => {
-  const ctx = await setup();
+test("item 2 (eff, followUpWindowMs=0): a finished turn is not followed: no transcript polls, and later unsolicited messages are not posted", async () => {
+  const ctx = await setup({ extraOptions: { followUpWindowMs: 0 } });
   ctx.gw.onPrompt = () => { ctx.gw.reply("sure"); };
   await ctx.bridge.handleEvent(mention("hello"));
   assert.deepEqual(texts(ctx), ["sure"]);
@@ -210,8 +210,8 @@ test("item 2 (eff): a finished turn is not followed: no transcript polls, and la
   assert.deepEqual(texts(ctx), ["sure"]);
 });
 
-test("item 2: late reply of a pending (timed-out) turn follows its chat, survives a restart, never duplicates, and stops after it is answered", async () => {
-  const first = await setup({ replyTimeoutMs: 200 });
+test("item 2 (followUpWindowMs=0): late reply of a pending (timed-out) turn follows its chat, survives a restart, never duplicates, and stops after it is answered", async () => {
+  const first = await setup({ replyTimeoutMs: 200, extraOptions: { followUpWindowMs: 0 } });
   first.gw.onPrompt = () => { first.gw.status = { isRunning: true }; };
   const event = mention("start job");
   await first.bridge.ingest(event);
@@ -220,7 +220,7 @@ test("item 2: late reply of a pending (timed-out) turn follows its chat, survive
   assert.equal(first.state.getLateTurn(AGENT, nonce)?.reason, "timeout", "timed-out turn stays pending");
 
   // Restart: new bridge, same state file, same transcript.
-  const second = await setup({ statePath: first.statePath });
+  const second = await setup({ statePath: first.statePath, extraOptions: { followUpWindowMs: 0 } });
   second.gw.entries = first.gw.entries;
   second.gw.seq = first.gw.seq;
   await second.bridge.pollLateOnce();
@@ -244,7 +244,7 @@ test("item 2: a chat that is no longer configured for the agent never receives l
   // Restart with config where the group now belongs to another agent.
   const second = await setup({
     statePath: first.statePath,
-    groups: [{ jid: GROUP, name: "PJ Boys", agent: OTHER_AGENT, mode: "mention" }],
+    groups: [{ jid: GROUP, name: "Test Group", agent: OTHER_AGENT, mode: "mention" }],
   });
   second.gw.entries = first.gw.entries;
   second.gw.seq = first.gw.seq;
@@ -254,8 +254,8 @@ test("item 2: a chat that is no longer configured for the agent never receives l
   assert.ok(second.log.lines.some((line) => /Late message not delivered .*reason=chat-not-configured-for-agent/.test(line)));
 });
 
-test("item 2: the follower leaves an agent alone while its live turn is running (no double delivery, order kept)", async () => {
-  const ctx = await setup();
+test("item 2 (followUpWindowMs=0): the follower leaves an agent alone while its live turn is running (no double delivery, order kept)", async () => {
+  const ctx = await setup({ extraOptions: { followUpWindowMs: 0 } });
   ctx.gw.onPrompt = () => {
     ctx.gw.status = { isRunning: true, isRunningTurn: true };
     setTimeout(() => ctx.gw.reply("a"), 10);
@@ -355,7 +355,7 @@ test("late-quote fix: a late reply quotes its own turn's message (by turn/nonce,
   const nJ = `whatsapp:${GROUP}:QJEFF`;
   const nX = `whatsapp:${GROUP}:QOTHER`;
   const nB = `whatsapp:${GROUP}:QJAMES:batch2`;
-  const agents = [{ id: AGENT, name: "PJ" }, { id: OTHER_AGENT, name: "Other" }];
+  const agents = [{ id: AGENT, name: "Test" }, { id: OTHER_AGENT, name: "Other" }];
   for (const id of ["QJEFF", "QOTHER", "QJAMES"]) ctx.bridge.inboundRaw.set(id, { key: { id, remoteJid: GROUP } });
   await ctx.state.setTurnQuote(AGENT, nJ, { chatId: GROUP, msgId: "QJEFF" });
   await ctx.state.setTurnQuote(AGENT, nB, { chatId: GROUP, msgId: "QJAMES" });
@@ -381,4 +381,308 @@ test("late-quote fix: a late reply quotes its own turn's message (by turn/nonce,
   assert.equal(reloaded.getTurnQuote(AGENT, nJ)?.msgId, "QJEFF");
   assert.equal(ctx.bridge.quotedForNonce(GROUP, nB, AGENT)?.key?.id, "QJAMES");
   assert.equal(ctx.bridge.quotedForNonce(GROUP, undefined, AGENT), undefined);
+});
+
+// ---------- follow-up window: entries after end_turn ----------
+
+test("follow-up: after a completed turn, a later SendToUser (background-completion wake) is delivered once, in order, quoting its own question", async () => {
+  let clock = Date.now();
+  const ctx = await setup({ now: () => clock });
+  ctx.gw.onPrompt = () => { ctx.gw.reply("Looking now."); ctx.gw.reply("I'll post picks once checked."); };
+  const event = mention("cheaper picks?");
+  await ctx.bridge.handleEvent(event);
+  assert.deepEqual(texts(ctx), ["Looking now.", "I'll post picks once checked."]);
+  const nonce = `whatsapp:${GROUP}:${event.id}`;
+  assert.equal(ctx.state.getLateTurn(AGENT, nonce)?.followUp, true, "conversation is watched after the turn");
+  await ctx.bridge.pollLateOnce();
+  assert.equal(ctx.transport.sent.length, 2, "nothing replayed");
+  ctx.gw.reply("Here are 3 picks");
+  ctx.gw.reply("Want me to book one?");
+  clock += 60_000;
+  ctx.bridge.followUpIdle.clear();
+  await ctx.bridge.pollLateOnce();
+  assert.deepEqual(texts(ctx).slice(2), ["Here are 3 picks", "Want me to book one?"]);
+  assert.ok([undefined, event.id].includes(ctx.transport.sent[2].quoted), "late part: no quote or quotes its own question");
+  assert.equal(ctx.transport.sent[3].quoted, undefined);
+  ctx.bridge.followUpIdle.clear();
+  await ctx.bridge.pollLateOnce();
+  assert.equal(ctx.transport.sent.length, 4, "never duplicated");
+});
+
+test("follow-up: window extends on each new entry and closes after followUpWindowMs; idle polling backs off", async () => {
+  let clock = Date.now();
+  const ctx = await setup({ now: () => clock });
+  ctx.gw.onPrompt = () => { ctx.gw.reply("ok"); };
+  const event = mention("hi");
+  await ctx.bridge.handleEvent(event);
+  const nonce = `whatsapp:${GROUP}:${event.id}`;
+  const firstUntil = ctx.state.getLateTurn(AGENT, nonce).followUntil;
+  // idle backoff: a second poll right away does not hit the gateway
+  await ctx.bridge.pollLateOnce();
+  const polls = ctx.bridge.metrics.latePolls;
+  await ctx.bridge.pollLateOnce();
+  assert.equal(ctx.bridge.metrics.latePolls, polls, "idle follow-up is backed off");
+  assert.ok(ctx.bridge.followUpIdle.get(AGENT).nextAt - clock <= 30_000);
+  clock += 8 * 60_000;
+  ctx.gw.reply("late one");
+  ctx.bridge.followUpIdle.clear();
+  await ctx.bridge.pollLateOnce();
+  assert.deepEqual(texts(ctx), ["ok", "late one"]);
+  assert.ok(ctx.state.getLateTurn(AGENT, nonce).followUntil > firstUntil, "extended");
+  clock += 9 * 60_000; // still inside the extended window
+  ctx.gw.reply("later one");
+  ctx.bridge.followUpIdle.clear();
+  await ctx.bridge.pollLateOnce();
+  assert.deepEqual(texts(ctx), ["ok", "late one", "later one"]);
+  clock += 11 * 60_000;
+  ctx.gw.reply("too late");
+  await ctx.bridge.pollLateOnce();
+  assert.equal(ctx.state.getLateTurn(AGENT, nonce), undefined, "window closed");
+  assert.ok(ctx.log.lines.some((l) => /Follow-up window closed agent=agent-test/.test(l)));
+  const before = ctx.bridge.metrics.latePolls;
+  await ctx.bridge.pollLateOnce();
+  assert.equal(ctx.bridge.metrics.latePolls, before, "no polling after the window");
+  assert.equal(texts(ctx).includes("too late"), false);
+});
+
+test("follow-up: survives a restart without resending, then delivers the new entry once", async () => {
+  const first = await setup();
+  first.gw.onPrompt = () => { first.gw.reply("ack"); };
+  await first.bridge.handleEvent(mention("go"));
+  const second = await setup({ statePath: first.statePath });
+  second.gw.entries = first.gw.entries;
+  second.gw.seq = first.gw.seq;
+  await second.bridge.pollLateOnce();
+  assert.equal(second.transport.sent.length, 0, "ack not resent after restart");
+  second.gw.reply("result after restart");
+  second.bridge.followUpIdle.clear();
+  await second.bridge.pollLateOnce();
+  second.bridge.followUpIdle.clear();
+  await second.bridge.pollLateOnce();
+  assert.deepEqual(texts(second), ["result after restart"]);
+});
+
+test("follow-up: a late entry with the same text just sent to the chat is skipped (duplicate text guard)", async () => {
+  const ctx = await setup();
+  ctx.gw.onPrompt = () => { ctx.gw.reply("Here are the picks for Wednesday night"); };
+  await ctx.bridge.handleEvent(mention("picks?"));
+  ctx.gw.reply("Here are the picks for Wednesday night");
+  ctx.bridge.followUpIdle.clear();
+  await ctx.bridge.pollLateOnce();
+  assert.deepEqual(texts(ctx), ["Here are the picks for Wednesday night"]);
+  assert.ok(ctx.log.lines.some((l) => /Late duplicate text skipped/.test(l)));
+});
+
+test("follow-up: a faq-only sender's late entry still goes through the account-data backstop", async () => {
+  const ctx = await setup();
+  ctx.gw.onPrompt = () => { ctx.gw.reply("ok"); };
+  const event = mention("price?");
+  await ctx.bridge.handleEvent(event);
+  const nonce = `whatsapp:${GROUP}:${event.id}`;
+  ctx.bridge.turnAccess.set(nonce, "faq-only");
+  ctx.gw.reply("Invoice INV-2026-001 total RM 1,500.00");
+  ctx.bridge.followUpIdle.clear();
+  await ctx.bridge.pollLateOnce();
+  assert.equal(texts(ctx).some((t) => /INV-2026-001|1,500/.test(t ?? "")), false);
+});
+
+// ---------- batch2 ----------
+
+function realStyle(ctx, nonce, turn, texts, { prompt = true, at = Date.now() } = {}) {
+  if (prompt) ctx.gw.entries.push({ id: `t${turn}u`, kind: "message", role: "user", clientNonce: nonce, content: "q", timestampMs: at });
+  texts.forEach((text, i) => ctx.gw.entries.push({ id: `t${turn}s${i}`, kind: "send-message", timestampMs: at, message: { type: "text", content: text } }));
+}
+
+test("batch2 #3: same-turn t20s2 and new-turn wake t21s0 (no WhatsApp prompt) both reach the open follow-up watch's chat, once", async () => {
+  const ctx = await setup();
+  const event = mention("cheaper picks?");
+  const nonce = `whatsapp:${GROUP}:${event.id}`;
+  ctx.gw.onPrompt = (body) => {
+    ctx.gw.entries.pop(); // replace the fake prompt with a real-style one
+    realStyle(ctx, body.clientNonce, 20, ["Looking now.", "I'll post them here."]);
+  };
+  await ctx.bridge.handleEvent(event);
+  assert.deepEqual(texts(ctx), ["Looking now.", "I'll post them here."]);
+  realStyle(ctx, null, 20, [], { prompt: false });
+  ctx.gw.entries.push({ id: "t20s2", kind: "send-message", timestampMs: Date.now(), message: { type: "text", content: "Here are 3 picks at around 30 to 50 per person" } });
+  ctx.gw.entries.push({ id: "t21u", kind: "message", role: "user", content: "[background task finished]", timestampMs: Date.now() }); // wake, no nonce
+  ctx.gw.entries.push({ id: "t21s0", kind: "send-message", timestampMs: Date.now(), message: { type: "text", content: "Also checked: all three are open on Wednesday" } });
+  ctx.bridge.followUpIdle.clear();
+  await ctx.bridge.pollLateOnce();
+  ctx.bridge.followUpIdle.clear();
+  await ctx.bridge.pollLateOnce();
+  assert.deepEqual(texts(ctx).slice(2), ["Here are 3 picks at around 30 to 50 per person", "Also checked: all three are open on Wednesday"]);
+  assert.ok(ctx.transport.sent.slice(2).every((m) => m.chatId === GROUP));
+  assert.ok(ctx.log.lines.some((l) => /Late wake entry linked .*entry=t21s0/.test(l)));
+  assert.ok(ctx.state.getLateTurn(AGENT, nonce)?.followUp);
+});
+
+test("batch2 #3: a desktop user's turn (other client nonce) is never linked to a WhatsApp watch", async () => {
+  const ctx = await setup();
+  ctx.gw.onPrompt = (body) => { ctx.gw.entries.pop(); realStyle(ctx, body.clientNonce, 5, ["ok"]); };
+  await ctx.bridge.handleEvent(mention("hi"));
+  ctx.gw.entries.push({ id: "t6u", kind: "message", role: "user", clientNonce: "desktop-uuid", content: "private", timestampMs: Date.now() });
+  ctx.gw.entries.push({ id: "t6s0", kind: "send-message", timestampMs: Date.now(), message: { type: "text", content: "private desktop answer for the owner" } });
+  ctx.bridge.followUpIdle.clear();
+  await ctx.bridge.pollLateOnce();
+  assert.deepEqual(texts(ctx), ["ok"]);
+});
+
+test("batch2 #1: turn access is persisted with the watch; after a restart a faq-only turn is still filtered, and unknown access fails closed", async () => {
+  const groups = [{ jid: GROUP, name: "Test Group", agent: AGENT, mode: "mention", members: [{ name: "Boss", role: "admin", ids: ["+10999999999"] }] }];
+  const first = await setup({ groups });
+  first.gw.onPrompt = () => { first.gw.reply("ok"); };
+  const event = mention("price?");
+  await first.bridge.handleEvent(event);
+  const nonce = `whatsapp:${GROUP}:${event.id}`;
+  assert.equal(first.state.getLateTurn(AGENT, nonce)?.access, "faq-only", "sender not on member list -> faq-only persisted");
+  const second = await setup({ statePath: first.statePath, groups });
+  second.gw.entries = first.gw.entries; second.gw.seq = first.gw.seq;
+  second.gw.reply("Invoice INV-2026-001 total RM 1,500.00 due Friday");
+  await second.bridge.pollLateOnce();
+  assert.equal(texts(second).some((t) => /INV-2026-001|1,500/.test(t ?? "")), false);
+  // Unknown access (no record field) in a member-list group -> faq-only.
+  await second.state.setLateTurn(AGENT, nonce, { access: undefined });
+  assert.equal(second.bridge.accessFor(AGENT, nonce, GROUP), "faq-only");
+  assert.equal(second.bridge.accessFor(AGENT, "whatsapp:x@g.us:none", OTHER_GROUP), undefined, "group without member list: no guard");
+});
+
+test("batch2 #2: duplicate-text guard compares the full split message, ignores short texts, and survives a restart", async () => {
+  const groups = [{ jid: GROUP, name: "Test Group", agent: AGENT, mode: "mention", splitReplies: true }];
+  const long = "Here are three picks for Wednesday.\n\nFirst, Cafe One downtown.\n\nSecond, Cafe Two uptown.\n\nThird, Cafe Three.";
+  const first = await setup({ groups });
+  first.gw.onPrompt = () => { first.gw.reply(long); first.gw.reply("Noted"); };
+  await first.bridge.handleEvent(mention("picks?"));
+  assert.ok(first.transport.sent.length >= 2);
+  const second = await setup({ statePath: first.statePath, groups });
+  second.gw.entries = first.gw.entries; second.gw.seq = first.gw.seq;
+  second.gw.reply(long);      // regenerated duplicate of the split message
+  second.gw.reply("Noted");   // short: exempt
+  second.bridge.followUpIdle.clear();
+  await second.bridge.pollLateOnce();
+  assert.deepEqual(texts(second), ["Noted"]);
+  assert.ok(second.log.lines.some((l) => /Late duplicate text skipped/.test(l)));
+});
+
+test("batch2 #4: several messages arrive mid-turn; a late post for the first lands after newer answers and quotes its own question", async () => {
+  const ctx = await setup();
+  let n = 0;
+  ctx.gw.onPrompt = (body) => {
+    n += 1;
+    ctx.gw.entries.pop();
+    realStyle(ctx, body.clientNonce, n, [n === 1 ? "Checking, give me a minute." : `Answer ${n}`]);
+  };
+  const a = mention("first question about dinner");
+  await ctx.bridge.handleEvent(a);
+  const b = ctx.bridge.handleEvent(mention("second question"));
+  const c = ctx.bridge.handleEvent(mention("third question"));
+  await Promise.all([b, c]);
+  assert.deepEqual(texts(ctx), ["Checking, give me a minute.", "Answer 2", "Answer 3"]);
+  // Turn 1's result lands after the newer answers.
+  ctx.gw.entries.push({ id: "t1s1", kind: "send-message", timestampMs: Date.now(), message: { type: "text", content: "Result for the first question: table for 6 is free at 7:30pm" } });
+  ctx.bridge.followUpIdle.clear();
+  await ctx.bridge.pollLateOnce();
+  const late = ctx.transport.sent.at(-1);
+  assert.equal(late.text, "Result for the first question: table for 6 is free at 7:30pm");
+  assert.equal(late.quoted, a.id, "quotes its own (first) question");
+  assert.equal(ctx.log.lines.some((l) => /reason=superseded/.test(l)), false);
+});
+
+test("batch2 #5: after a restart (no cached message) the late post quotes a persisted stub of its question; without participant it falls back to 'Re: …'", async () => {
+  const first = await setup();
+  first.gw.onPrompt = () => { first.gw.reply("ack"); };
+  const event = mention("is the cafe open next Wednesday?");
+  await first.bridge.handleEvent(event);
+  const nonce = `whatsapp:${GROUP}:${event.id}`;
+  const saved = first.state.getTurnQuote(AGENT, nonce);
+  assert.equal(saved.text, "is the cafe open next Wednesday?");
+  assert.equal(saved.participant, "123456789012345@lid");
+  const second = await setup({ statePath: first.statePath });
+  second.gw.entries = first.gw.entries; second.gw.seq = first.gw.seq;
+  second.gw.reply("Yes, the cafe is open on Wednesday from 6pm");
+  second.bridge.followUpIdle.clear();
+  await second.bridge.pollLateOnce();
+  assert.equal(second.transport.sent[0].quoted, event.id, "stub quote after restart");
+  // No participant -> no stub possible -> Re: line instead of a quote.
+  await second.state.setTurnQuote(AGENT, nonce, { chatId: GROUP, msgId: event.id, text: "is the cafe open next Wednesday?" });
+  second.gw.reply("Update: they close at 10pm that night");
+  second.bridge.followUpIdle.clear();
+  await second.bridge.pollLateOnce();
+  const last = second.transport.sent.at(-1);
+  assert.equal(last.quoted, undefined);
+  assert.match(last.text, /^Re: "is the cafe open next Wednesday\?"\n\nUpdate: they close at 10pm/);
+});
+
+test("batch2 #6: a reply wait that times out after a host pause retries the prompt once (logged), and a late answer to the original is not posted too", async () => {
+  const ctx = await setup({ replyTimeoutMs: 200 });
+  let prompts = 0;
+  ctx.gw.onPrompt = (body) => {
+    prompts += 1;
+    if (prompts === 1) { ctx.gw.status = { isRunning: true }; ctx.transport.lastPauseAt = Date.now() + 50; return; }
+    ctx.gw.status = { isRunning: false };
+    ctx.gw.reply("Here is your answer after the retry", { clientNonce: undefined });
+  };
+  const event = mention("hi, what's my balance?");
+  await ctx.bridge.ingest(event);
+  assert.equal(prompts, 2, "retried exactly once");
+  assert.match(ctx.gw.prompts[1].clientNonce, /:retry$/);
+  assert.deepEqual(texts(ctx), ["Here is your answer after the retry"]);
+  assert.ok(ctx.log.lines.some((l) => /Pause retry chat=120363000000000021@g\.us msg=M\d+/.test(l)));
+  assert.equal(texts(ctx).includes(ERROR_NOTICE), false);
+  // The original (pre-pause) turn answers late: not posted as well.
+  const t = ctx.gw.entries.findIndex((e) => e.clientNonce === `whatsapp:${GROUP}:${event.id}`);
+  assert.ok(t >= 0);
+  assert.equal(ctx.state.getLateTurn(AGENT, `whatsapp:${GROUP}:${event.id}`), undefined);
+});
+
+test("batch2 #6: no pause -> no retry (plain timeout keeps the old behaviour)", async () => {
+  const ctx = await setup({ replyTimeoutMs: 200 });
+  let prompts = 0;
+  ctx.gw.onPrompt = () => { prompts += 1; ctx.gw.status = { isRunning: true }; };
+  await ctx.bridge.ingest(mention("slow job"));
+  assert.equal(prompts, 1);
+  assert.deepEqual(texts(ctx), [ERROR_NOTICE]);
+});
+
+// ---------- unrecorded prompt after a host pause ----------
+
+test("pause: replies to a prompt sent just before a pause whose state write was lost are adopted and posted once (access from the trusted header)", async () => {
+  const ctx = await setup();
+  ctx.gw.onPrompt = (body) => { ctx.gw.entries.pop(); realStyle(ctx, body.clientNonce, 218, ["menu"]); };
+  await ctx.bridge.handleEvent(mention("what can you do?"));
+  const lost = `whatsapp:${GROUP}:LOSTMSG`;
+  const at = Date.now();
+  ctx.gw.entries.push({ id: "t219u", kind: "message", role: "user", clientNonce: lost, timestampMs: at,
+    content: "[whatsapp-from] name=\"Alex\"\n[whatsapp-role] role=friend authorised=Y access=account\n\nweather?" });
+  ctx.gw.entries.push({ id: "t219s475", kind: "send-message", timestampMs: at, message: { type: "text", content: "Checking the weather now." } });
+  ctx.gw.entries.push({ id: "t219s476", kind: "send-message", timestampMs: at, message: { type: "text", content: "It will rain in all three today" } });
+  ctx.transport.lastPauseAt = at + 20_000; ctx.transport.lastPauseMs = 126_000;
+  ctx.bridge.followUpIdle.clear();
+  await ctx.bridge.pollLateOnce();
+  ctx.bridge.followUpIdle.clear();
+  await ctx.bridge.pollLateOnce();
+  assert.deepEqual(texts(ctx), ["menu", "Checking the weather now.", "It will rain in all three today"]);
+  assert.ok(ctx.log.lines.some((l) => /Late message adopted .*entry=t219s475 .*reason=prompt-unrecorded-after-pause/.test(l)));
+  assert.equal(ctx.state.getLateTurn(AGENT, lost)?.access, "account");
+});
+
+test("pause: an unrecorded prompt is still skipped without a pause, or when another turn handled the same message", async () => {
+  const ctx = await setup();
+  ctx.gw.onPrompt = (body) => { ctx.gw.entries.pop(); realStyle(ctx, body.clientNonce, 10, ["hi"]); };
+  await ctx.bridge.handleEvent(mention("hello"));
+  const at = Date.now();
+  ctx.gw.entries.push({ id: "t11u", kind: "message", role: "user", clientNonce: `whatsapp:${GROUP}:NOPAUSE`, timestampMs: at, content: "x" });
+  ctx.gw.entries.push({ id: "t11s0", kind: "send-message", timestampMs: at, message: { type: "text", content: "no pause: must not post" } });
+  ctx.bridge.followUpIdle.clear();
+  await ctx.bridge.pollLateOnce();
+  assert.deepEqual(texts(ctx), ["hi"]);
+  // Pause now, but the same message was re-handled under another nonce (e.g. a batch after the rollback).
+  await ctx.state.setTurnQuote(AGENT, `whatsapp:${GROUP}:DUPMSG:batch2`, { chatId: GROUP, msgId: "DUPMSG" });
+  ctx.gw.entries.push({ id: "t12u", kind: "message", role: "user", clientNonce: `whatsapp:${GROUP}:DUPMSG`, timestampMs: at, content: "x" });
+  ctx.gw.entries.push({ id: "t12s0", kind: "send-message", timestampMs: at, message: { type: "text", content: "duplicate of the lost run" } });
+  ctx.transport.lastPauseAt = at + 5_000; ctx.transport.lastPauseMs = 60_000;
+  ctx.bridge.followUpIdle.clear();
+  await ctx.bridge.pollLateOnce();
+  assert.deepEqual(texts(ctx), ["hi"]);
+  assert.ok(ctx.log.lines.some((l) => /entry=t12s0 reason=prompt-not-pending/.test(l)));
 });

@@ -27,6 +27,10 @@ export class JsonStateStore {
     this.lateTurns = {};
     // chatId -> sentAt of the newest turn whose reply was actually posted (ordering guard).
     this.chatAnswered = {};
+    // chatId -> [{ at, hash }] full texts recently posted (late duplicate-text guard; survives restarts).
+    this.recentOutbound = {};
+    // chatId -> { msgId: { nonce, at } } which turn last answered an inbound message (supersede guard).
+    this.answeredMsgs = {};
     this.saveQueue = Promise.resolve();
   }
 
@@ -81,6 +85,8 @@ export class JsonStateStore {
         : {};
       this.lateTurns = parsed.lateTurns && typeof parsed.lateTurns === "object" ? parsed.lateTurns : {};
       this.chatAnswered = parsed.chatAnswered && typeof parsed.chatAnswered === "object" ? parsed.chatAnswered : {};
+      this.recentOutbound = parsed.recentOutbound && typeof parsed.recentOutbound === "object" ? parsed.recentOutbound : {};
+      this.answeredMsgs = parsed.answeredMsgs && typeof parsed.answeredMsgs === "object" ? parsed.answeredMsgs : {};
       const approvalsChanged = this.#pruneExpiredApprovals();
       const promptContextsChanged = this.#preparePromptContextsAfterLoad();
       if (approvalsChanged || promptContextsChanged) await this.#save();
@@ -193,6 +199,46 @@ export class JsonStateStore {
     delete this.lateTurns[key];
     await this.#save();
     return true;
+  }
+
+  /** Was this full-text hash posted to the chat within windowMs? */
+  hasRecentOutbound(chatId, hash, { now = Date.now(), windowMs = 10 * 60_000 } = {}) {
+    return (this.recentOutbound[chatId] ?? []).some((item) => item?.hash === hash && now - item.at <= windowMs);
+  }
+
+  async recordOutbound(chatId, hash, { now = Date.now(), keepMs = 30 * 60_000 } = {}) {
+    if (!chatId || !hash) return;
+    const list = (this.recentOutbound[chatId] ?? []).filter((item) => Number.isFinite(item?.at) && now - item.at <= keepMs);
+    list.push({ at: now, hash });
+    this.recentOutbound[chatId] = list.slice(-30);
+    for (const [chat, items] of Object.entries(this.recentOutbound)) if (!items.length) delete this.recentOutbound[chat];
+    await this.#save();
+  }
+
+  /** Other turns (nonces) this bridge recorded for the same inbound message. */
+  turnNoncesForMsg(agentId, chatId, msgId) {
+    const out = [];
+    for (const [key, value] of Object.entries(this.turnQuotes)) {
+      if (value?.chatId !== chatId || value?.msgId !== msgId) continue;
+      try {
+        const [owner, nonce] = JSON.parse(key);
+        if (owner === agentId) out.push(nonce);
+      } catch {}
+    }
+    return out;
+  }
+
+  getMsgAnswered(chatId, msgId) {
+    return msgId ? this.answeredMsgs[chatId]?.[msgId] : undefined;
+  }
+
+  async markMsgAnswered(chatId, msgId, nonce, at) {
+    if (!chatId || !msgId) return;
+    const map = { ...(this.answeredMsgs[chatId] ?? {}), [msgId]: { nonce, at } };
+    const keys = Object.keys(map);
+    for (const old of keys.slice(0, Math.max(0, keys.length - 100))) delete map[old];
+    this.answeredMsgs[chatId] = map;
+    await this.#save();
   }
 
   getChatAnswered(chatId) {
@@ -442,6 +488,8 @@ export class JsonStateStore {
         ...(Object.keys(this.lastServedByAgent).length ? { lastServedByAgent: this.lastServedByAgent } : {}),
         ...(Object.keys(this.lateTurns).length ? { lateTurns: this.lateTurns } : {}),
         ...(Object.keys(this.chatAnswered).length ? { chatAnswered: this.chatAnswered } : {}),
+        ...(Object.keys(this.recentOutbound).length ? { recentOutbound: this.recentOutbound } : {}),
+        ...(Object.keys(this.answeredMsgs).length ? { answeredMsgs: this.answeredMsgs } : {}),
       })}\n`;
       await writeFileDurable(this.filename, payload);
     };

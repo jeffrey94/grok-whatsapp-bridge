@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import { HANDOFF_NOTICE, isTopLevelPromptEntry } from "./grok-client.js";
 import {
@@ -22,6 +23,7 @@ import {
 } from "./core/chat-policy.js";
 import { Dispatcher } from "./core/dispatcher.js";
 import { bareJid } from "./core/routing.js";
+import { formatContextBlock } from "./core/chat-buffer.js";
 import { smartSplit, splitText, toWhatsAppText } from "./whatsapp/format.js";
 
 export const HELP = [
@@ -144,9 +146,9 @@ export function chatFromNonce(nonce) {
   return bareJid(chat) === chat && /@(?:g\.us|s\.whatsapp\.net|lid)$/.test(chat) ? chat : undefined;
 }
 
-/** "t310s655" -> "t310" (gateway transcript ids); undefined for other id shapes. */
+/** "t310s655" / "t310u" -> "t310" (gateway transcript ids); undefined for other id shapes. */
 export function transcriptTurnId(id) {
-  const match = /^(t\d+)s\d+$/.exec(typeof id === "string" ? id : "");
+  const match = /^(t\d+)(?:s\d+|u)$/.exec(typeof id === "string" ? id : "");
   return match?.[1];
 }
 
@@ -168,8 +170,10 @@ function normalizeName(value) {
  *   transport.wasSentByUs?(messageId)
  */
 export class WhatsAppBridge {
-  constructor({ grok, state, router, guard, transport, log = console, options = {}, journal }) {
+  constructor({ grok, state, router, guard, transport, log = console, options = {}, journal, chatBuffer }) {
     this.grok = grok;
+    // Tag-mode groups: rolling buffer of unforwarded messages (src/core/chat-buffer.js).
+    this.chatBuffer = chatBuffer;
     // Optional write-ahead journal of accepted inbound messages (src/journal.js).
     this.journal = journal;
     this.state = state;
@@ -207,6 +211,18 @@ export class WhatsAppBridge {
       // A turn is followed by the late poller only while it is pending (prompt sent,
       // final reply not posted) and for at most this long after its live wait ended.
       lateMaxAgeMs: 10 * 60_000,
+      // After a turn completes, keep watching its conversation for new agent
+      // entries (e.g. a SendToUser from a background-completion wake) for this
+      // long; each newly delivered entry extends the window. 0 disables it.
+      followUpWindowMs: 10 * 60_000,
+      // Idle follow-up polling backs off from lateDeliveryPollMs up to this.
+      followUpPollMaxMs: 30_000,
+      // Late duplicate-text guard: full message text (all bubbles) already posted
+      // to the chat within this window is not posted again; short texts are exempt.
+      dupTextWindowMs: 10 * 60_000,
+      dupTextMinChars: 25,
+      // Retry a prompt once when its reply wait timed out after a host pause.
+      pauseRetry: true,
       // Per-agent backoff for transient gateway errors (HTTP 5xx, timeouts) in the poller.
       latePollMaxBackoffMs: 60_000,
       streamReplies: true,
@@ -259,6 +275,10 @@ export class WhatsAppBridge {
     this.reactTimes = new Map();
     // agentId -> { failures, nextAt } (late poller backoff with jitter).
     this.latePollBackoff = new Map();
+    // agentId -> { idle, nextAt } (cheap backoff while only follow-up watches are open).
+    this.followUpIdle = new Map();
+    // clientNonce -> { prompt, attachmentPaths, attachmentNames } (one pause retry per turn).
+    this.turnPrompts = new Map();
     this.metrics = { latePolls: 0, latePollErrors: 0, lateSkipped: 0, lateExpired: 0, promptsReused: 0, journalReplayed: 0 };
   }
 
@@ -388,6 +408,20 @@ export class WhatsAppBridge {
     if (!access) return;
     this.turnAccess.set(clientNonce, access);
     if (this.turnAccess.size > 500) this.turnAccess.delete(this.turnAccess.keys().next().value);
+  }
+
+  /**
+   * Access level of the sender behind a turn: in memory, else persisted with the
+   * late/follow-up watch. Unknown in a group that uses the member list (e.g.
+   * after a restart) fails closed to faq-only.
+   */
+  accessFor(agentId, clientNonce, chatId) {
+    const known = clientNonce ? this.turnAccess.get(clientNonce) : undefined;
+    if (known) return known;
+    const saved = clientNonce ? this.state.getLateTurn?.(agentId, clientNonce)?.access : undefined;
+    if (saved) return saved === "none" ? undefined : saved;
+    const group = this.router.groupFor?.(chatId);
+    return group?.members && group.faqOnlyGuard !== false ? "faq-only" : undefined;
   }
 
   /** Serialize every delivery for one agent (live turn + late follower) so nothing is sent twice. */
@@ -529,10 +563,30 @@ export class WhatsAppBridge {
     const saved = agentId ? this.state.getTurnQuote?.(agentId, clientNonce) : undefined;
     if (saved && saved.chatId !== chatId) return undefined;
     const msgId = saved?.msgId ?? msgIdFromNonce(clientNonce);
-    const raw = msgId ? this.inboundRaw.get(msgId) : undefined;
+    let raw = msgId ? this.inboundRaw.get(msgId) : undefined;
+    const isGroup = chatId.endsWith("@g.us");
+    if (!raw && msgId && saved?.text && (!isGroup || saved.participant)) {
+      // Persisted copy of the question (survives restarts): minimal quote stub.
+      raw = {
+        key: { remoteJid: chatId, id: msgId, fromMe: false, ...(isGroup ? { participant: saved.participant } : {}) },
+        message: { conversation: saved.text },
+      };
+    }
     if (!raw) return undefined;
     const group = this.router.groupFor?.(chatId);
     return this.quoteAllowed(group ? { kind: "group", group } : { kind: "dm" }) ? raw : undefined;
+  }
+
+  /** Late post: quote its own question; if that is impossible, a short "Re: …" line. */
+  lateQuote(chatId, clientNonce, agentId) {
+    const quoted = this.quotedForNonce(chatId, clientNonce, agentId);
+    if (quoted || !clientNonce) return { quoted };
+    const group = this.router.groupFor?.(chatId);
+    if (!this.quoteAllowed(group ? { kind: "group", group } : { kind: "dm" })) return {};
+    const text = this.state.getTurnQuote?.(agentId, clientNonce)?.text;
+    if (typeof text !== "string" || !text.trim()) return {};
+    const short = text.replace(/\s+/g, " ").trim();
+    return { rePrefix: `Re: "${short.length > 60 ? `${short.slice(0, 57)}…` : short}"` };
   }
 
   /** A single reaction on a bot message: small trusted prompt, no quote. */
@@ -643,6 +697,11 @@ export class WhatsAppBridge {
         keywords: route.group.keywords,
       });
       if (!decision.handle) {
+        if (decision.buffer && this.chatBuffer) {
+          const added = this.chatBuffer.add(chatId, items);
+          this.log.info(`Buffered group message reason=${decision.reason} chat=${chatId} items=${added} buffered=${this.chatBuffer.size(chatId)}`);
+          return { dropped: decision.reason, buffered: added };
+        }
         this.log.info(`Drop group message reason=${decision.reason} chat=${chatId} items=${items.length}`);
         return { dropped: decision.reason };
       }
@@ -721,13 +780,14 @@ export class WhatsAppBridge {
       return { handled: "resumed" };
     }
 
+    const recentBlock = this.takeRecentChat(route, chatId, items);
     // No "typing…" for all-mode soft forwards: most end in the silent token, and
     // WhatsApp keeps showing "composing" to the whole group until we pause it.
     const showTyping = this.options.typingIndicator && !decision.softForward;
     return this.runPromptTurn({
       input, options, agent, route, chatId, primary, quoted, clientNonce, showTyping, mediaItems,
       senderText: text, allowSlowAck: !decision.softForward && !trigger,
-      buildPrompt: () => `${header}\n\n${text}`,
+      buildPrompt: () => `${header}\n\n${recentBlock ? `${recentBlock}\n\n` : ""}${text}`,
       logLabel: isBundle ? `Media bundle turn chat=${chatId} agent=${agent.id} messages=${items.length}` : undefined,
     });
   }
@@ -784,6 +844,11 @@ export class WhatsAppBridge {
           mode: route.group.mode,
           keywords: route.group.keywords,
         });
+      }
+      if (!decision.handle && decision.buffer && this.chatBuffer) {
+        this.chatBuffer.add(primary.chatId, items);
+        this.log.info(`Batch buffered message reason=${decision.reason} chat=${primary.chatId} msg=${primary.id}`);
+        continue;
       }
       if (!decision.handle || (!text && !mediaItems.length)) {
         this.log.info(`Batch skip message reason=${decision.handle ? "empty" : decision.reason} chat=${primary.chatId} msg=${primary.id}`);
@@ -869,14 +934,23 @@ export class WhatsAppBridge {
       return { handled: "resumed" };
     }
     const showTyping = this.options.typingIndicator && !softForward && Boolean(answerTarget);
+    const recentBlock = this.takeRecentChat(route, chatId, kept.flatMap((k) => k.items));
     const result = await this.runPromptTurn({
       input: { ...input, batch: kept.map((k) => k.unit) },
       options, agent, route, chatId, primary: last.primary, quoted, clientNonce, showTyping, mediaItems,
       senderText: answerTarget?.text ?? "", allowSlowAck: !softForward && Boolean(answerTarget),
-      buildPrompt: () => `${intro}\n\n${blocks.join("\n\n")}`,
+      buildPrompt: () => `${intro}\n\n${recentBlock ? `${recentBlock}\n\n` : ""}${blocks.join("\n\n")}`,
       logLabel: `Backlog batch turn chat=${chatId} agent=${agent.id} messages=${keptCount} skipped=${units.length - kept.length} oldestAgeMs=${oldestAgeMs}`,
     });
     return { ...result, batched: keptCount };
+  }
+
+  /** Tag mode: the buffered chat since the bot's last turn there, as one block (buffer cleared). */
+  takeRecentChat(route, chatId, items = []) {
+    if (route?.kind !== "group" || route.group?.mode !== "tag" || !this.chatBuffer) return "";
+    const recent = this.chatBuffer.take(chatId, { excludeIds: items.map((item) => item?.id).filter(Boolean) });
+    if (recent.length) this.log.info(`Tag mode context chat=${chatId} messages=${recent.length}`);
+    return formatContextBlock(recent);
   }
 
   /** Upload attachments, send the prompt, record its context and hold the queue for the reply. */
@@ -906,7 +980,16 @@ export class WhatsAppBridge {
       if (failed) prompt += `\n\n[${failed} attachment${failed === 1 ? "" : "s"} could not be downloaded from WhatsApp]`;
       if (logLabel) this.log.info(`${logLabel} attachments=${attachmentPaths.length}`);
 
-      await this.state.setTurnQuote?.(agent.id, clientNonce, { chatId, msgId: primary.id }, { now: this.options.now() });
+      const questionText = typeof primary.text === "string" ? primary.text.replace(/^(?:@\d+\s*)+/, "").trim().slice(0, 200) : "";
+      const participant = primary.raw?.key?.participant ?? primary.sender?.jid;
+      await this.state.setTurnQuote?.(agent.id, clientNonce, {
+        chatId,
+        msgId: primary.id,
+        ...(questionText ? { text: questionText } : {}),
+        ...(chatId.endsWith("@g.us") && typeof participant === "string" ? { participant } : {}),
+      }, { now: this.options.now() });
+      this.turnPrompts.set(clientNonce, { prompt, attachmentPaths, attachmentNames, input, primary, route });
+      if (this.turnPrompts.size > 100) this.turnPrompts.delete(this.turnPrompts.keys().next().value);
       const reuse = this.mayHaveSentBefore(input) && await this.promptAlreadySent(agent.id, clientNonce, options);
       if (reuse) {
         this.metrics.promptsReused += 1;
@@ -917,7 +1000,7 @@ export class WhatsAppBridge {
       const sentAt = this.options.now();
       // The agent has it now: the inbound messages leave the write-ahead journal.
       this.journal?.remove(this.inputEvents(input).map((event) => `${event.chatId}|${event.id}`));
-      await this.state.setLateTurn?.(agent.id, clientNonce, { chatId, sentAt, armedAt: sentAt, reason: "live" });
+      await this.state.setLateTurn?.(agent.id, clientNonce, { chatId, sentAt, armedAt: sentAt, reason: "live", access: this.turnAccess.get(clientNonce) ?? "none" });
       await this.state.setPromptContext(agent.id, clientNonce, {
         contextKey: clientNonce,
         clientNonce,
@@ -1049,6 +1132,8 @@ export class WhatsAppBridge {
             return { timedOut: true, delivered: turn.handled };
           }
           this.log.warn(`Turn wait timed out chat=${chatId} delivered=0${follow}`);
+          const retried = await this.retryAfterPause(agent, clientNonce, { chatId, quoted, signal, progress });
+          if (retried) return retried;
         }
         throw error;
       }
@@ -1082,12 +1167,56 @@ export class WhatsAppBridge {
   }
 
   /**
+   * Pause case: the reply wait timed out with nothing delivered and the host was
+   * paused during the wait. Send the same prompt once more under a retry nonce;
+   * the original turn is retired so a late answer to it is not posted as well.
+   */
+  async retryAfterPause(agent, clientNonce, { chatId, quoted, signal, progress }) {
+    if (!this.options.pauseRetry || /:retry$/.test(clientNonce)) return undefined;
+    const saved = this.turnPrompts.get(clientNonce);
+    const record = this.state.getLateTurn?.(agent.id, clientNonce);
+    const pauseAt = this.transport.lastPauseAt;
+    if (!saved || !record || !Number.isFinite(pauseAt) || pauseAt < (record.sentAt ?? Infinity)) return undefined;
+    try {
+      const entries = await this.transcriptTail(agent.id, { signal });
+      const index = entries.findIndex((entry) => isTopLevelPromptEntry(entry) && entry.clientNonce === clientNonce);
+      const turnId = index >= 0 ? transcriptTurnId(entries[index].id) : undefined;
+      const answered = index >= 0 && entries.slice(index + 1).some((entry) => entry.kind === "send-message"
+        && (!turnId || transcriptTurnId(entry.id) === turnId));
+      if (answered) return undefined; // the agent did answer; the late follower posts it
+    } catch (error) {
+      if (signal?.aborted || error?.name === "AbortError") throw error;
+      this.log.warn(`Pause retry check failed chat=${chatId} reason=${error.message}; not retrying`);
+      return undefined;
+    }
+    const retryNonce = `${clientNonce}:retry`;
+    this.log.warn(`Pause retry chat=${chatId} msg=${msgIdFromNonce(clientNonce) ?? "?"} agent=${agent.id} pauseAt=${new Date(pauseAt).toISOString()} (timed out after a host pause; sending the prompt once more)`);
+    await this.state.deleteLateTurn?.(agent.id, clientNonce);
+    await this.state.retirePromptTurn?.(agent.id, clientNonce, clientNonce);
+    await this.state.deletePromptContext?.(agent.id, clientNonce);
+    const access = this.turnAccess.get(clientNonce);
+    if (access) this.rememberTurnAccess(retryNonce, access);
+    const quote = this.state.getTurnQuote?.(agent.id, clientNonce);
+    if (quote) await this.state.setTurnQuote?.(agent.id, retryNonce, quote, { now: this.options.now() });
+    this.turnPrompts.set(retryNonce, saved);
+    await this.grok.sendPrompt(agent.id, saved.prompt, retryNonce, { signal, attachmentPaths: saved.attachmentPaths, attachmentNames: saved.attachmentNames });
+    const sentAt = this.options.now();
+    await this.state.setLateTurn?.(agent.id, retryNonce, { chatId, sentAt, armedAt: sentAt, reason: "pause-retry", access: access ?? "none" });
+    await this.state.setPromptContext?.(agent.id, retryNonce, {
+      contextKey: retryNonce, clientNonce: retryNonce, origin: "whatsapp", chatId,
+      isGroup: chatId.endsWith("@g.us"), replyToMessageId: msgIdFromNonce(clientNonce), createdAt: sentAt, awaitingCompletion: true,
+    });
+    this.log.info(`Prompt sent chat=${chatId} msg=${msgIdFromNonce(clientNonce) ?? "?"} agent=${agent.id} retry=pause`);
+    return this.completeTurn(agent, retryNonce, { chatId, quoted, signal, progress });
+  }
+
+  /**
    * Deliver send-message entries to one chat. Each transcript entry has one
    * delivery key per agent, so the live turn, a recovered turn and the late
    * follower can never send the same entry twice. `turn` carries quoting and
    * handoff state across streaming calls.
    */
-  async deliverEntries(agent, clientNonce, entries, { chatId, quoted, turn = newTurnState(), late = false }) {
+  async deliverEntries(agent, clientNonce, entries, { chatId, quoted, turn = newTurnState(), late = false, rePrefix }) {
     for (const entry of entries) {
       if (entry?.kind !== "send-message" || turn.stopped) continue;
       if (APPROVAL_ENTRY_TYPES.has(entry.message?.type)) {
@@ -1132,7 +1261,16 @@ export class WhatsAppBridge {
         continue;
       }
       let text = content.text ? toWhatsAppText(stripTranscriptPreamble(content.text)) : "";
-      if (clientNonce && this.turnAccess.get(clientNonce) === "faq-only" && containsAccountData(text)) {
+      const textHash = text ? createHash("sha256").update(text.replace(/\s+/g, " ").trim()).digest("hex").slice(0, 32) : undefined;
+      if (late && textHash && (progress.nextPart ?? 0) === 0 && text.replace(/\s+/g, " ").trim().length >= this.options.dupTextMinChars
+        && this.state.hasRecentOutbound?.(chatId, textHash, { now: this.options.now(), windowMs: this.options.dupTextWindowMs })) {
+        this.log.info(`Late duplicate text skipped chat=${chatId} entry=${entry.id}`);
+        await this.state.completeDeliveryProgress?.(deliveryKey, { nextPart: 0, silent: true, duplicateText: true });
+        turn.handled += 1;
+        continue;
+      }
+      if (late && rePrefix && !quoted && !turn.quoteUsed && text && (progress.nextPart ?? 0) === 0) text = `${toWhatsAppText(rePrefix)}\n\n${text}`;
+      if (this.accessFor(agent.id, clientNonce, chatId) === "faq-only" && containsAccountData(text)) {
         // Code-level backstop: a sender who is not on the group's member list
         // (or not authorised) never gets amounts, facility codes or invoice numbers.
         this.log.warn(`Blocked account data for faq-only sender chat=${chatId} entry=${entry.id}`);
@@ -1204,6 +1342,7 @@ export class WhatsAppBridge {
         await this.state.setDeliveryProgress?.(deliveryKey, progress);
       }
       await this.state.completeDeliveryProgress?.(deliveryKey, progress);
+      if (!turn.stopped && textHash) await this.state.recordOutbound?.(chatId, textHash, { now: this.options.now() });
       turn.handled += 1;
       if (!turn.stopped) this.log.info(`Delivered chat=${chatId} entry=${entry.id} parts=${parts.length}${late ? " late=yes" : ""}`);
     }
@@ -1221,11 +1360,30 @@ export class WhatsAppBridge {
     const record = this.state.getLateTurn?.(agentId, clientNonce);
     const sentAt = record?.sentAt ?? this.options.now();
     await this.state.markChatAnswered?.(chatId ?? record?.chatId, sentAt);
+    const msgId = this.state.getTurnQuote?.(agentId, clientNonce)?.msgId ?? msgIdFromNonce(clientNonce);
+    if (msgId && !/:react$/.test(clientNonce ?? "")) await this.state.markMsgAnswered?.(chatId ?? record?.chatId, msgId, clientNonce, this.options.now());
   }
 
   /** Final reply handled (posted, silent or reaction): nothing more to poll for this turn. */
   async finishLateTurn(agentId, clientNonce, { chatId, posted }) {
     if (posted) await this.markAnswered(agentId, clientNonce, chatId);
+    const record = this.state.getLateTurn?.(agentId, clientNonce);
+    const target = chatId ?? record?.chatId;
+    if (this.options.followUpWindowMs > 0 && target && clientNonce && this.state.setLateTurn) {
+      // Keep watching this conversation for later agent entries (persisted, so a
+      // restart resumes the watch; delivery keys prevent any resend).
+      const now = this.options.now();
+      await this.state.setLateTurn(agentId, clientNonce, {
+        chatId: target,
+        sentAt: record?.sentAt ?? now,
+        armedAt: now,
+        reason: "follow-up",
+        followUp: true,
+        followUntil: now + this.options.followUpWindowMs,
+      });
+      this.followUpIdle.delete(agentId);
+      return;
+    }
     await this.state.deleteLateTurn?.(agentId, clientNonce);
   }
 
@@ -1238,13 +1396,44 @@ export class WhatsAppBridge {
   lateGuard(agentId, target, entry) {
     const record = target?.clientNonce ? this.state.getLateTurn?.(agentId, target.clientNonce) : undefined;
     let reason;
+    if (!record && target?.clientNonce && this.unrecordedAfterPause(agentId, target)) {
+      return { ok: true, adopt: true };
+    }
     if (!record) reason = target?.clientNonce ? "prompt-not-pending" : "unknown-prompt";
-    else if (this.options.now() - (record.armedAt ?? record.sentAt ?? 0) > this.options.lateMaxAgeMs) reason = "too-old";
-    else if (!record.background && (this.state.getChatAnswered?.(target.chatId) ?? -Infinity) > (record.sentAt ?? 0)) reason = "superseded";
+    else if (record.followUp ? this.options.now() > (record.followUntil ?? 0) : this.options.now() - (record.armedAt ?? record.sentAt ?? 0) > this.options.lateMaxAgeMs) reason = "too-old";
+    else {
+      // Clearly superseded only: the same question was answered later by ANOTHER
+      // turn (e.g. a retry). A newer answer to a different message is fine; the
+      // late post then quotes its own question.
+      const msgId = this.state.getTurnQuote?.(agentId, target.clientNonce)?.msgId ?? msgIdFromNonce(target.clientNonce);
+      const answered = this.state.getMsgAnswered?.(target.chatId, msgId);
+      if (answered && answered.nonce !== target.clientNonce && answered.at > (record.sentAt ?? 0)) reason = "superseded";
+    }
     if (!reason) return { ok: true, record };
     this.metrics.lateSkipped += 1;
     this.log.warn(`Late message skipped agent=${agentId} chat=${target?.chatId} entry=${entry?.id} reason=${reason}`);
     return { ok: false, reason };
+  }
+
+  /**
+   * A WhatsApp prompt this bridge sent but has no record of: the host was paused
+   * (or rolled back) right after sending it, so its state writes were lost. Its
+   * replies are adopted when the prompt is recent, falls inside the pause, and no
+   * other turn of this bridge handled the same message (that one owns the answer).
+   */
+  unrecordedAfterPause(agentId, target) {
+    const at = target.promptAt;
+    const pauseAt = this.transport.lastPauseAt;
+    const pauseMs = this.transport.lastPauseMs ?? 0;
+    if (!Number.isFinite(at) || !Number.isFinite(pauseAt)) return false;
+    if (this.options.now() - at > this.options.lateMaxAgeMs) return false;
+    if (at < pauseAt - pauseMs - 5 * 60_000 || at > pauseAt + 60_000) return false;
+    const msgId = msgIdFromNonce(target.clientNonce);
+    if (!msgId || chatFromNonce(target.clientNonce) !== target.chatId) return false;
+    const others = this.state.turnNoncesForMsg?.(agentId, target.chatId, msgId) ?? [];
+    if (others.some((nonce) => nonce !== target.clientNonce)) return false;
+    if (this.state.getMsgAnswered?.(target.chatId, msgId)) return false;
+    return true;
   }
 
   /** Is this chat, in the CURRENT config, routed to this agent? */
@@ -1253,6 +1442,16 @@ export class WhatsAppBridge {
     if (!wanted && served?.chatId === chatId && served.dmId) wanted = this.router.agentForChat?.(served.dmId);
     if (!wanted) return false;
     return wanted === agentId || this.resolveAgent(wanted, agents)?.id === agentId;
+  }
+
+  /** Newest open (pending or follow-up) watch of an agent, preferring the given chat. */
+  openWatchFor(agentId, chatHint) {
+    const now = this.options.now();
+    const open = (this.state.listLateTurns?.() ?? []).filter((record) => record.agentId === agentId
+      && (record.followUp ? now <= (record.followUntil ?? 0) : now - (record.armedAt ?? record.sentAt ?? 0) <= this.options.lateMaxAgeMs));
+    const pool = open.some((record) => record.chatId === chatHint) ? open.filter((record) => record.chatId === chatHint) : open;
+    if (!pool.length || new Set(pool.map((record) => record.chatId)).size > 1) return undefined; // ambiguous: don't guess
+    return pool.reduce((a, b) => ((b.sentAt ?? 0) > (a.sentAt ?? 0) ? b : a));
   }
 
   /** Which chat, if any, a late send-message entry belongs to. */
@@ -1274,14 +1473,22 @@ export class WhatsAppBridge {
     if (!servedAt || now - servedAt > windowMs) return undefined;
     // The window is measured from that chat's own prompt (an accepted inbound message).
     this.guard.openReplyWindow(chatId, Math.min(servedAt, now));
-    return { chatId, clientNonce: owner?.kind === "whatsapp" ? owner.clientNonce : undefined };
+    return {
+      chatId,
+      clientNonce: owner?.kind === "whatsapp" ? owner.clientNonce : undefined,
+      ...(owner?.kind === "whatsapp" ? { promptAt: owner.at, promptAccess: owner.access } : {}),
+    };
   }
 
   promptOwner(entry) {
     const chatId = chatFromNonce(entry?.clientNonce);
-    return chatId
-      ? { kind: "whatsapp", chatId, clientNonce: entry.clientNonce, promptId: entry.id, at: Number.isFinite(entry.timestampMs) ? entry.timestampMs : undefined }
-      : { kind: "other" };
+    if (chatId) {
+      // Access as written by this bridge in the trusted [whatsapp-role] header (user copies are stripped).
+      const access = /^\[whatsapp-role\][^\n]*\baccess=(full|account|faq-only)\b/m.exec(typeof entry.content === "string" ? entry.content : "")?.[1];
+      return { kind: "whatsapp", chatId, clientNonce: entry.clientNonce, promptId: entry.id, at: Number.isFinite(entry.timestampMs) ? entry.timestampMs : undefined, ...(access ? { access } : {}) };
+    }
+    // No client nonce at all: a system/background wake, not another client's user.
+    return typeof entry?.clientNonce === "string" && entry.clientNonce ? { kind: "other" } : { kind: "wake", promptId: entry?.id };
   }
 
   async transcriptTail(agentId, options = {}) {
@@ -1359,6 +1566,10 @@ export class WhatsAppBridge {
       const turnId = transcriptTurnId(entry?.id);
       if (turnId && isTopLevelPromptEntry(entry) && !promptByTurn.has(turnId)) promptByTurn.set(turnId, this.promptOwner(entry));
     }
+    const minTurn = (() => {
+      for (const entry of entries) { const id = transcriptTurnId(entry?.id); if (id) return Number(id.slice(1)); }
+      return undefined;
+    })();
     const turns = new Map();
     const answeredThisPass = new Map();
     for (let index = cursorIndex + 1; index < entries.length; index += 1) {
@@ -1373,24 +1584,51 @@ export class WhatsAppBridge {
           entryOwner = this.promptOwner(entry);
         } else {
           const turnId = transcriptTurnId(entry.id);
-          if (turnId && promptByTurn.has(turnId)) entryOwner = promptByTurn.get(turnId);
+          const turnPrompt = turnId ? promptByTurn.get(turnId) : undefined;
+          // Turn started by a wake (no prompt entry in view although the turn is
+          // newer than the oldest entry we see, or a prompt without any client
+          // nonce): link it to the agent's open follow-up watch for this chat.
+          // Never link when the latest prompt before it came from another client (desktop user).
+          const wakeTurn = turnId && owner?.kind !== "other" && (turnPrompt?.kind === "wake"
+            || (!turnPrompt && Number.isFinite(minTurn) && Number(turnId.slice(1)) > minTurn));
+          const watch = wakeTurn ? this.openWatchFor(agentId, served?.chatId ?? owner?.chatId) : undefined;
+          if (watch) {
+            entryOwner = { kind: "whatsapp", chatId: watch.chatId, clientNonce: watch.clientNonce, at: watch.sentAt };
+            this.log.info(`Late wake entry linked agent=${agentId} entry=${entry.id} chat=${watch.chatId} msg=${msgIdFromNonce(watch.clientNonce) ?? "?"}`);
+          } else if (turnPrompt) entryOwner = turnPrompt;
           else if (turnId && owner?.clientNonce && transcriptTurnId(owner.promptId) && transcriptTurnId(owner.promptId) !== turnId) {
             quoteKnown = false; // own prompt not in view: same chat, but no quote
           }
         }
         let target = this.lateTarget(agentId, entryOwner, served, agents, entry);
         if (target && !quoteKnown) target.clientNonce = undefined;
-        if (target && !(target.clientNonce && answeredThisPass.has(target.clientNonce)) && !this.lateGuard(agentId, target, entry).ok) target = undefined;
+        if (target && !(target.clientNonce && answeredThisPass.has(target.clientNonce))) {
+          const verdict = this.lateGuard(agentId, target, entry);
+          if (!verdict.ok) target = undefined;
+          else if (verdict.adopt) {
+            const now = this.options.now();
+            this.log.warn(`Late message adopted agent=${agentId} chat=${target.chatId} entry=${entry.id} msg=${msgIdFromNonce(target.clientNonce)} reason=prompt-unrecorded-after-pause`);
+            await this.state.setLateTurn?.(agentId, target.clientNonce, {
+              chatId: target.chatId, sentAt: target.promptAt, armedAt: now, reason: "adopted-after-pause",
+              access: target.promptAccess ?? (this.router.groupFor?.(target.chatId)?.members ? "faq-only" : "none"),
+            });
+          }
+        }
         if (target) {
           const turnKey = `${target.chatId}|${target.clientNonce ?? ""}`;
           if (!turns.has(turnKey)) turns.set(turnKey, newTurnState());
+          const handledBefore = turns.get(turnKey).handled;
+          const lateQuote = this.lateQuote(target.chatId, target.clientNonce, agentId);
           await this.deliverEntries({ id: agentId }, target.clientNonce, [entry], {
             chatId: target.chatId,
-            quoted: this.quotedForNonce(target.chatId, target.clientNonce, agentId),
+            quoted: lateQuote.quoted,
+            rePrefix: lateQuote.rePrefix,
             turn: turns.get(turnKey),
             late: true,
           });
-          if (!answeredThisPass.has(target.clientNonce)) answeredThisPass.set(target.clientNonce, { chatId: target.chatId, turn: turns.get(turnKey) });
+          // Entries already delivered earlier (delivery key done) neither finish nor extend a watch.
+          const newlyHandled = turns.get(turnKey).handled > handledBefore;
+          if (newlyHandled && !answeredThisPass.has(target.clientNonce)) answeredThisPass.set(target.clientNonce, { chatId: target.chatId, turn: turns.get(turnKey) });
         }
       }
       await this.state.setMirrorCursor(agentId, entry.id);
@@ -1399,6 +1637,7 @@ export class WhatsAppBridge {
     for (const [clientNonce, { chatId, turn }] of answeredThisPass) {
       await this.finishLateTurn(agentId, clientNonce, { chatId, posted: turn.sentParts > 0 });
     }
+    return answeredThisPass.size;
   }
 
   /** Transient gateway trouble (warm-up after a pause): back off, don't hammer. */
@@ -1421,31 +1660,52 @@ export class WhatsAppBridge {
     if (!(windowMs > 0)) return;
     const now = this.options.now();
     const byAgent = new Map();
+    const followOnly = new Map(); // agentId -> true while it has only follow-up watches
     for (const record of this.state.listLateTurns?.() ?? []) {
       const age = now - (record.armedAt ?? record.sentAt ?? 0);
+      if (record.followUp) {
+        if (now > (record.followUntil ?? 0)) {
+          this.log.info(`Follow-up window closed agent=${record.agentId} chat=${record.chatId} msg=${msgIdFromNonce(record.clientNonce) ?? "?"}`);
+          await this.state.deleteLateTurn(record.agentId, record.clientNonce);
+          continue;
+        }
+        if (!byAgent.has(record.agentId)) { byAgent.set(record.agentId, record); followOnly.set(record.agentId, true); }
+        continue;
+      }
       if (age > this.options.lateMaxAgeMs || now - (record.sentAt ?? 0) > windowMs) {
         this.metrics.lateExpired += 1;
         this.log.warn(`Late reply gave up agent=${record.agentId} chat=${record.chatId} msg=${msgIdFromNonce(record.clientNonce) ?? "?"} reason=expired armed=${record.reason ?? "?"} ageMs=${age}`);
         await this.state.deleteLateTurn(record.agentId, record.clientNonce);
         continue;
       }
-      if (!byAgent.has(record.agentId)) byAgent.set(record.agentId, record);
+      if (!byAgent.has(record.agentId) || followOnly.get(record.agentId)) byAgent.set(record.agentId, record);
+      followOnly.set(record.agentId, false);
     }
     for (const backoffAgent of this.latePollBackoff.keys()) if (!byAgent.has(backoffAgent)) this.latePollBackoff.delete(backoffAgent);
+    for (const idleAgent of this.followUpIdle.keys()) if (!followOnly.get(idleAgent)) this.followUpIdle.delete(idleAgent);
     let agents;
     for (const [agentId, record] of byAgent) {
       // A live turn (or recovery) is streaming this agent's replies itself.
       if (this.activeTurns.has(agentId) || this.pendingRecovery.has(agentId)) continue;
       const backoff = this.latePollBackoff.get(agentId);
       if (backoff && now < backoff.nextAt) continue;
+      const idle = followOnly.get(agentId) ? this.followUpIdle.get(agentId) : undefined;
+      if (idle && now < idle.nextAt) continue;
       const served = this.state.getLastServed?.(agentId) ?? { chatId: record.chatId, at: record.sentAt };
       try {
         agents ??= await this.grok.listAgents(options);
         this.metrics.latePolls += 1;
-        await this.withAgentLock(agentId, () => (this.activeTurns.has(agentId)
+        const delivered = await this.withAgentLock(agentId, () => (this.activeTurns.has(agentId)
           ? undefined
           : this.followAgent(agentId, served, agents, options)));
         this.latePollBackoff.delete(agentId);
+        if (followOnly.get(agentId) && !delivered) {
+          const idleCount = (idle?.idle ?? 0) + 1;
+          const base = Math.max(1, this.options.lateDeliveryPollMs);
+          this.followUpIdle.set(agentId, { idle: idleCount, nextAt: now + Math.min(this.options.followUpPollMaxMs, base * (2 ** Math.min(idleCount, 20))) });
+        } else {
+          this.followUpIdle.delete(agentId);
+        }
       } catch (error) {
         if (options.signal?.aborted || error.name === "AbortError") throw error;
         this.metrics.latePollErrors += 1;
@@ -1605,10 +1865,12 @@ export class WhatsAppBridge {
    * (rate limits, silent token, Bot_Log by the agent). At most one per group
    * per `scheduledCheckCooldownMs`.
    */
-  async runScheduledCheck(chatId, { source = "local-cli", id = String(this.options.now()), signal } = {}) {
+  async runScheduledCheck(chatId, { source = "local-cli", id = String(this.options.now()), signal, adminPrompt } = {}) {
     const group = this.router.groupFor?.(chatId);
     if (!group) return { dropped: "group-not-configured" };
-    if (!group.allowNudge) return { dropped: "nudge-not-allowed" };
+    const admin = typeof adminPrompt === "string" && adminPrompt.trim() ? adminPrompt.trim().slice(0, 2000) : undefined;
+    // Admin prompts (scripts/admin-prompt.mjs, box-only) work in any configured group.
+    if (!admin && !group.allowNudge) return { dropped: "nudge-not-allowed" };
     const cooldown = this.options.scheduledCheckCooldownMs ?? 120_000;
     const last = this.lastScheduledCheck.get(group.jid) ?? 0;
     if (this.options.now() - last < cooldown) return { dropped: "cooldown" };
@@ -1620,27 +1882,30 @@ export class WhatsAppBridge {
       return { dropped: "agent-not-found" };
     }
     const safeId = String(id).replace(/[^A-Za-z0-9-]/g, "").slice(0, 40) || "x";
-    const clientNonce = `whatsapp:${group.jid}:nudge-${safeId}`;
+    const clientNonce = `whatsapp:${group.jid}:nudge-${admin ? "admin-" : ""}${safeId}`;
+    if (this.state.isPromptTurnRetired?.(agent.id, clientNonce) || this.state.getPromptContext?.(agent.id, clientNonce)) {
+      return { dropped: "duplicate" };
+    }
     const header = buildContextHeader({
-      sender: { name: "scheduled check" },
+      sender: { name: admin ? "group admin (via the box)" : "scheduled check" },
       chat: { jid: group.jid, type: "group", name: this.transport.chatName?.(group.jid) ?? group.name },
-      member: { role: "system", authorised: true, access: "full", name: "bridge scheduler" },
-      trigger: { kind: "scheduled-check", source: source === "bdm" ? "bdm" : "local-cli" },
+      member: { role: "system", authorised: true, access: "full", name: admin ? "admin prompt" : "bridge scheduler" },
+      trigger: { kind: admin ? "admin-prompt" : "scheduled-check", source: source === "bdm" ? "bdm" : "local-cli" },
     });
     return this.dispatcher.enqueue(`agent:${agent.id}`, async () => {
       // A deliberate, operator-triggered exception to reply-only: open this group's window now.
       this.guard.openReplyWindow(group.jid);
       this.beginTurn(agent.id);
       try {
-        await this.grok.sendPrompt(agent.id, `${header}\n\n${SCHEDULED_CHECK_PROMPT}`, clientNonce, { signal });
+        await this.grok.sendPrompt(agent.id, `${header}\n\n${admin ?? SCHEDULED_CHECK_PROMPT}`, clientNonce, { signal });
         await this.state.setPromptContext(agent.id, clientNonce, {
           contextKey: clientNonce, clientNonce, origin: "whatsapp", chatId: group.jid, isGroup: true,
           createdAt: this.options.now(), awaitingCompletion: true,
         });
         await this.state.setLastServed?.(agent.id, { chatId: group.jid, at: this.options.now() });
-        this.log.info(`Scheduled check sent chat=${group.jid} agent=${agent.id} source=${source}`);
+        this.log.info(`${admin ? "Admin prompt" : "Scheduled check"} sent chat=${group.jid} agent=${agent.id} source=${source} id=${safeId}`);
         await this.completeTurn(agent, clientNonce, { chatId: group.jid, signal });
-        return { handled: "scheduled-check", clientNonce, agentId: agent.id };
+        return { handled: admin ? "admin-prompt" : "scheduled-check", clientNonce, agentId: agent.id };
       } finally {
         this.endTurn(agent.id);
       }

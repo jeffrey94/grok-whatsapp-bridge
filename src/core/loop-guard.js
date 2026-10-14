@@ -175,6 +175,12 @@ export class LoopGuard {
     this.recentOutbound.set(chatId, list.slice(-20));
   }
 
+  /** Same text already sent to this chat within echoWindowMs (late-delivery duplicate guard). */
+  isRecentOutbound(chatId, text) {
+    if (typeof text !== "string" || !text.trim()) return false;
+    return this.#isEcho(chatId, text);
+  }
+
   #isEcho(chatId, text) {
     const list = this.recentOutbound.get(chatId) ?? [];
     const hash = digest(text);

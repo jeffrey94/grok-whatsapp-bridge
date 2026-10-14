@@ -289,6 +289,12 @@ export function matchesKeyword(text, keywords = []) {
  */
 export function decideGroupMessage({ mentioned = false, replyToBot = false, text = "", noise = false, mode = "mention", keywords = [] } = {}) {
   const trimmed = typeof text === "string" ? text.trim() : "";
+  if (mode === "tag") {
+    // Tag mode: ONLY an @mention of the bot or a reply to a bot message is forwarded.
+    if (mentioned) return { handle: true, softForward: false, reason: "mention" };
+    if (replyToBot) return { handle: true, softForward: false, reason: "reply-to-bot" };
+    return { handle: false, softForward: false, reason: "tag-mode-untagged", buffer: true };
+  }
   if (mentioned) return { handle: true, softForward: false, reason: "mention" };
   if (replyToBot) return { handle: true, softForward: false, reason: "reply-to-bot" };
   if (trimmed.startsWith("/") && trimmed.length > 1) return { handle: true, softForward: false, reason: "command" };

@@ -100,7 +100,7 @@ export class ChatRouter {
         jid,
         name: group.name,
         agent: group.agent,
-        mode: group.mode === "all" ? "all" : "mention",
+        mode: ["all", "tag"].includes(group.mode) ? group.mode : "mention",
         keywords: Array.isArray(group.keywords) ? group.keywords : [],
         allowSenders: new Set((group.allowSenders ?? []).map(normalizeUserId).filter(Boolean)),
         quoteReplies: group.quoteReplies !== false,
