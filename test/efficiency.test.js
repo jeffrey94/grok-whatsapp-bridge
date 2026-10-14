@@ -21,9 +21,9 @@ import { writeFileDurable } from "../src/durable-fs.js";
 import { fakeAuthStateFactory, fakeSocketFactory, recordingLog, waitFor, writePairedCreds } from "./helpers/fake-baileys.js";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
-const AGENT = "agent-pj";
+const AGENT = "agent-test";
 const GROUP = "120363000000000021@g.us";
-const SELF = "60111111111@s.whatsapp.net";
+const SELF = "10111111111@s.whatsapp.net";
 
 // ---------- 1) light reconnects ----------
 
@@ -34,7 +34,7 @@ function adapterSetup(extra = {}) {
   const statusPath = path.join(dir, "state", "status.json");
   const status = new StatusFile(statusPath);
   const log = recordingLog();
-  const groups = { [GROUP]: { id: GROUP, subject: "PJ", participants: [{ id: "1@lid" }] } };
+  const groups = { [GROUP]: { id: GROUP, subject: "Test", participants: [{ id: "1@lid" }] } };
   const makeSocket = fakeSocketFactory({ groups });
   let listCalls = 0;
   const counted = (options) => {
@@ -45,7 +45,7 @@ function adapterSetup(extra = {}) {
   };
   counted.sockets = makeSocket.sockets;
   const transport = new BaileysTransport({
-    authDir, groups: [{ jid: GROUP, name: "PJ" }], log, status, onEvent: () => {}, makeSocket: counted,
+    authDir, groups: [{ jid: GROUP, name: "Test" }], log, status, onEvent: () => {}, makeSocket: counted,
     authStateFactory: fakeAuthStateFactory(), heartbeatMs: 3_600_000, pauseCheckMs: 0,
     groupsListPath: path.join(dir, "state", "groups.json"), ...extra,
   });
@@ -135,7 +135,7 @@ function fakeGateway() {
     },
   };
   const handlers = {
-    listAgents: () => ({ agents: [{ id: AGENT, name: "PJ", ...gw.status }] }),
+    listAgents: () => ({ agents: [{ id: AGENT, name: "Test", ...gw.status }] }),
     sendPrompt: (body) => {
       gw.prompts.push(body);
       gw.entries.push({ id: gw.id("u"), kind: "message", role: "user", clientNonce: body.clientNonce, content: body.prompt, timestampMs: Date.now() });
@@ -158,12 +158,12 @@ function fakeGateway() {
   return gw;
 }
 
-async function bridgeSetup({ statePath, now, journal, replyTimeoutMs = 5_000, transportExtra = {} } = {}) {
+async function bridgeSetup({ statePath, now, journal, replyTimeoutMs = 5_000, transportExtra = {}, extraOptions = {} } = {}) {
   const dir = statePath ? path.dirname(statePath) : mkdtempSync(path.join(tmpdir(), "wa-eff-b-"));
   const gw = fakeGateway();
   const state = new JsonStateStore(statePath ?? path.join(dir, "bridge-state.json"));
   await state.load();
-  const router = new ChatRouter({ defaultAgent: AGENT, dms: [], groups: [{ jid: GROUP, name: "PJ Boys", agent: AGENT, mode: "mention" }] });
+  const router = new ChatRouter({ defaultAgent: AGENT, dms: [], groups: [{ jid: GROUP, name: "Test Group", agent: AGENT, mode: "mention" }] });
   const log = recordingLog();
   const sent = [];
   const transport = {
@@ -171,13 +171,13 @@ async function bridgeSetup({ statePath, now, journal, replyTimeoutMs = 5_000, tr
     selfIds: () => [SELF],
     sendText: async (chatId, text, options = {}) => { sent.push({ chatId, text, quoted: options.quoted?.key?.id }); return { id: `B${sent.length}` }; },
     setTyping: async () => {},
-    chatName: () => "PJ Boys",
+    chatName: () => "Test Group",
     ...transportExtra,
   };
   const grok = new GrokClient("http://127.0.0.1:1340", "t", { fetchImpl: gw.fetchImpl, pollIntervalMs: 10, replyTimeoutMs });
   const bridge = new WhatsAppBridge({
     grok, state, router, guard: new LoopGuard(), transport, log, journal,
-    options: { sendDelayMs: 0, stableReplyMs: 40, lateDeliveryPollMs: 10, typingIndicator: false, ...(now ? { now } : {}) },
+    options: { sendDelayMs: 0, stableReplyMs: 40, lateDeliveryPollMs: 10, typingIndicator: false, ...(now ? { now } : {}), ...extraOptions },
   });
   return { dir, gw, state, bridge, transport, log, sent, texts: () => sent.map((s) => s.text) };
 }
@@ -187,7 +187,7 @@ function mention(text) {
   seq += 1;
   const id = `E${seq}`;
   return {
-    id, chatId: GROUP, sender: { jid: "123456789012345@lid" }, kind: "text", text: `@60111111111 ${text}`,
+    id, chatId: GROUP, sender: { jid: "123456789012345@lid" }, kind: "text", text: `@10111111111 ${text}`,
     mentionedJids: [SELF], timestamp: Math.floor(Date.now() / 1000), raw: { key: { id, remoteJid: GROUP }, message: { mediaKey: Buffer.from([1, 2, 3]) } },
   };
 }
@@ -195,8 +195,8 @@ const nonceOf = (event) => `whatsapp:${GROUP}:${event.id}`;
 
 // ---------- 2) pending-only poller with backoff ----------
 
-test("eff 2: the poller only polls agents with a pending turn, backs off with jitter on HTTP 500, and recovers", async () => {
-  const ctx = await bridgeSetup();
+test("eff 2 (followUpWindowMs=0): the poller only polls agents with a pending turn, backs off with jitter on HTTP 500, and recovers", async () => {
+  const ctx = await bridgeSetup({ extraOptions: { followUpWindowMs: 0 } });
   await ctx.bridge.pollLateOnce();
   assert.equal(ctx.gw.tailCalls, 0, "nothing pending: zero gateway calls");
   const nonce = `whatsapp:${GROUP}:P1`;
@@ -206,7 +206,7 @@ test("eff 2: the poller only polls agents with a pending turn, backs off with ji
   await ctx.bridge.pollLateOnce();
   const backoff = ctx.bridge.latePollBackoff.get(AGENT);
   assert.equal(backoff?.failures, 1);
-  assert.ok(ctx.log.lines.some((l) => /Late delivery failed agent=agent-pj reason=.*HTTP 500; retry in \d+ms \(failures=1\)/.test(l)));
+  assert.ok(ctx.log.lines.some((l) => /Late delivery failed agent=agent-test reason=.*HTTP 500; retry in \d+ms \(failures=1\)/.test(l)));
   const calls = ctx.gw.tailCalls;
   await ctx.bridge.pollLateOnce();
   assert.equal(ctx.gw.tailCalls, calls, "inside the backoff window: not polled again");
@@ -242,7 +242,7 @@ test("eff 2: a pending turn older than lateMaxAgeMs is given up (logged) and nev
   await ctx.bridge.pollLateOnce();
   assert.equal(ctx.gw.tailCalls, 0);
   assert.equal(ctx.state.getLateTurn(AGENT, nonce), undefined);
-  assert.ok(ctx.log.lines.some((l) => /Late reply gave up agent=agent-pj chat=.* msg=OLD reason=expired armed=timeout/.test(l)));
+  assert.ok(ctx.log.lines.some((l) => /Late reply gave up agent=agent-test chat=.* msg=OLD reason=expired armed=timeout/.test(l)));
 });
 
 // ---------- 3) late-delivery guards ----------
@@ -263,27 +263,28 @@ test("eff 3: rollback case: a late entry whose prompt this bridge never recorded
   assert.ok(ctx.log.lines.some((l) => /Late message skipped .*entry=t6s1 reason=prompt-not-pending/.test(l)));
 });
 
-test("eff 3: an older pending turn is not answered after a newer turn in the same chat was answered; background turns are exempt", async () => {
+test("eff 3 (batch2): a newer answer to a DIFFERENT message no longer drops an older late reply; the same question answered by another turn does", async () => {
   const ctx = await bridgeSetup();
   const now = Date.now();
   const older = `whatsapp:${GROUP}:O1`;
-  const bg = `whatsapp:${GROUP}:BG1`;
+  const dup = `whatsapp:${GROUP}:D1`;
   ctx.gw.entries.push(
     { id: "t7s0", kind: "message", role: "user", clientNonce: older, timestampMs: now },
-    { id: "t8s0", kind: "message", role: "user", clientNonce: bg, timestampMs: now },
-    { id: "t7s1", kind: "send-message", timestampMs: now, message: { type: "text", content: "stale answer" } },
-    { id: "t8s1", kind: "send-message", timestampMs: now, message: { type: "text", content: "background result" } },
+    { id: "t8s0", kind: "message", role: "user", clientNonce: dup, timestampMs: now },
+    { id: "t7s1", kind: "send-message", timestampMs: now, message: { type: "text", content: "older answer still useful" } },
+    { id: "t8s1", kind: "send-message", timestampMs: now, message: { type: "text", content: "answer to a question someone else already answered" } },
   );
   await ctx.state.setLateTurn(AGENT, older, { chatId: GROUP, sentAt: now - 5_000, armedAt: now, reason: "timeout" });
-  await ctx.state.setLateTurn(AGENT, bg, { chatId: GROUP, sentAt: now - 6_000, armedAt: now, reason: "background", background: true });
+  await ctx.state.setLateTurn(AGENT, dup, { chatId: GROUP, sentAt: now - 6_000, armedAt: now, reason: "timeout" });
   await ctx.state.markChatAnswered(GROUP, now - 1_000); // a newer turn got its answer
+  await ctx.state.markMsgAnswered(GROUP, "D1", `whatsapp:${GROUP}:D1:retry`, now - 1_000); // same question, other turn
   await ctx.bridge.pollLateOnce();
-  assert.deepEqual(ctx.texts(), ["background result"]);
-  assert.ok(ctx.log.lines.some((l) => /entry=t7s1 reason=superseded/.test(l)));
+  assert.deepEqual(ctx.texts(), ["older answer still useful"]);
+  assert.ok(ctx.log.lines.some((l) => /entry=t8s1 reason=superseded/.test(l)));
 });
 
-test("eff 3: a live turn that ends with a background task still running stays pending; a normal turn does not", async () => {
-  const ctx = await bridgeSetup();
+test("eff 3 (followUpWindowMs=0): a live turn that ends with a background task still running stays pending; a normal turn does not", async () => {
+  const ctx = await bridgeSetup({ extraOptions: { followUpWindowMs: 0 } });
   ctx.gw.onPrompt = () => {
     ctx.gw.status = { isRunning: true, isRunningTurn: true };
     setTimeout(() => { ctx.gw.reply("on it"); ctx.gw.status = { isRunning: true, isRunningTurn: false }; }, 10);

@@ -22,6 +22,12 @@
       "agent": "<job-reports-agent-id>",
       "mode": "all",
       "allowSenders": ["+<tech-1-phone-digits>", "+<tech-2-phone-digits>"]
+    },
+    {
+      "jid": "<friends-group-id>@g.us",
+      "name": "Friends (replies only when tagged)",
+      "agent": "<friends-agent-id>",
+      "mode": "tag"
     }
   ],
   "authDir": "auth",

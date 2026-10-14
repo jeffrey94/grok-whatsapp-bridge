@@ -13,14 +13,15 @@ import { ensurePrivateDir } from "./whatsapp/secure-fs.js";
  */
 export const NUDGE_MAX_AGE_MS = 10 * 60_000;
 
-export function queueNudge(dir, { group, source = "local-cli", now = Date.now() } = {}) {
+export function queueNudge(dir, { group, source = "local-cli", now = Date.now(), prompt } = {}) {
   const jid = normalizeGroupJid(group);
   if (!jid) throw new Error(`not a group JID: ${JSON.stringify(group)}`);
   ensurePrivateDir(dir);
   const id = `${now}-${randomUUID().slice(0, 8)}`;
   const finalPath = path.join(dir, `${id}.json`);
   const tmpPath = path.join(dir, `.${id}.tmp`);
-  writeFileSync(tmpPath, JSON.stringify({ group: jid, source, requestedAt: now, id }), { mode: 0o600, flag: "wx" });
+  const adminPrompt = typeof prompt === "string" && prompt.trim() ? prompt.trim().slice(0, 2000) : undefined;
+  writeFileSync(tmpPath, JSON.stringify({ group: jid, source, requestedAt: now, id, ...(adminPrompt ? { prompt: adminPrompt } : {}) }), { mode: 0o600, flag: "wx" });
   renameSync(tmpPath, finalPath);
   return { id, path: finalPath, group: jid };
 }
@@ -55,7 +56,12 @@ export function takeNudges(dir, { now = Date.now(), maxAgeMs = NUDGE_MAX_AGE_MS,
         log?.warn?.(`Nudge request ignored file=${name} reason=stale`);
         continue;
       }
-      requests.push({ group, id: String(request.id ?? name).replace(/[^A-Za-z0-9-]/g, ""), source: request.source === "bdm" ? "bdm" : "local-cli" });
+      requests.push({
+        group,
+        id: String(request.id ?? name).replace(/[^A-Za-z0-9-]/g, ""),
+        source: request.source === "bdm" ? "bdm" : "local-cli",
+        ...(typeof request.prompt === "string" && request.prompt.trim() ? { prompt: request.prompt.trim().slice(0, 2000) } : {}),
+      });
     } catch (error) {
       log?.warn?.(`Nudge request ignored file=${name} reason=${error.message}`);
       try { unlinkSync(file); } catch {}
@@ -70,8 +76,8 @@ export async function runNudgeInbox(bridge, { dir, pollMs = 2_000, signal, log }
   while (!signal?.aborted) {
     try {
       for (const request of takeNudges(dir, { now: bridge.options.now(), log })) {
-        log?.info?.(`Nudge request picked up chat=${request.group} id=${request.id}`);
-        void bridge.runScheduledCheck(request.group, { source: request.source, id: request.id, signal })
+        log?.info?.(`Nudge request picked up chat=${request.group} id=${request.id}${request.prompt ? " kind=admin-prompt" : ""}`);
+        void bridge.runScheduledCheck(request.group, { source: request.source, id: request.id, signal, ...(request.prompt ? { adminPrompt: request.prompt } : {}) })
           .then((result) => { if (result?.dropped) log?.warn?.(`Scheduled check not run chat=${request.group} reason=${result.dropped}`); })
           .catch((error) => log?.warn?.(`Scheduled check failed chat=${request.group} reason=${error.message}`));
       }

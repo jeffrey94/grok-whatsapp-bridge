@@ -66,6 +66,37 @@ WhatsApp chat <── reply (text / files) <──────────┘
   replies to one of its messages, on a `/command`, or when a configured
   keyword appears. With `"mode": "all"` it forwards every non-noise message
   and tells the agent it may stay quiet.
+- **Tag mode (`"mode": "tag"`).** Only an @mention of the bot or a reply to
+  one of its messages reaches the agent (reactions on bot messages work as
+  usual; `/commands` and keywords do not wake it). Everything else is kept in
+  a rolling per-group buffer (text, media as `[photo]`/`[voice note]`/
+  `[sticker]`…, sender name; max 50 messages, nothing older than 24 h) in
+  `state/chat-buffer.json` (mode 600, survives restarts). When the bot is
+  tagged, the buffered messages since its last turn in that group go with the
+  prompt as one compact `[whatsapp-recent-chat]` block (oldest first) before
+  the tagged message, and the buffer is cleared. Cheaper than `all` (one agent
+  turn per tag), with enough context to follow the conversation.
+- **Admin prompt.** `node scripts/admin-prompt.mjs --group <jid>@g.us --prompt
+  "…" --yes-post` gives that group's agent a one-off instruction from the box
+  (e.g. "post a short notice"); its reply goes out once through the normal
+  reply path. Dry run without `--yes-post`. The request inbox
+  (`state/nudges/`, mode 700) is always on, so admin prompts work in any
+  allowlisted group; scheduled checks still need `allowNudge`. Only someone on
+  the box can create a request; nothing arriving from WhatsApp can.
+- **Late-delivery hardening.** After a turn ends, its conversation stays
+  watched for `followUpWindowMs` (10 min, extended by each delivered entry) so
+  a background-task result still reaches the right chat; idle watching backs
+  off to `followUpPollMaxMs`. A wake-started turn is linked to the open watch
+  for that chat (never when the last prompt came from another client). The
+  sender's access level is saved with the watch, so the `faqOnlyGuard`
+  backstop still applies after a restart (unknown access fails closed). A late
+  message whose full text was already posted to the chat in the last
+  `dupTextWindowMs` (10 min, texts of `dupTextMinChars`+ characters) is
+  skipped. A late post quotes its own question (a saved stub after a restart)
+  or, if it can't, starts with a `Re: "…"` line. A reply wait that times out
+  right after a host pause is retried once (`pauseRetry`), and replies to a
+  prompt whose state write was lost in a pause are adopted once
+  (`reason=prompt-unrecorded-after-pause`).
 - **Silent reply.** If the agent answers with just `NO_WHATSAPP_REPLY` (also
   accepted: `[NO_WHATSAPP_REPLY]`, `NO_TELEGRAM_REPLY`, `⟦noreply⟧`), nothing
   is sent.

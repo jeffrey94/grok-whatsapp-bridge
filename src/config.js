@@ -87,8 +87,8 @@ export function parseConfig(raw, { baseDir = process.cwd(), readToken = true } =
     seenGroups.add(jid);
     const agent = typeof group.agent === "string" ? group.agent.trim() : "";
     if (!agent || isPlaceholder(agent)) throw new Error(`group ${jid} must map to one Grok agent id`);
-    if (group.mode !== undefined && !["mention", "all"].includes(group.mode)) {
-      throw new Error(`group ${jid} mode must be "mention" or "all"`);
+    if (group.mode !== undefined && !["mention", "all", "tag"].includes(group.mode)) {
+      throw new Error(`group ${jid} mode must be "mention", "all" or "tag"`);
     }
     if (group.members !== undefined) {
       if (!Array.isArray(group.members)) throw new Error(`group ${jid} members must be a list`);
