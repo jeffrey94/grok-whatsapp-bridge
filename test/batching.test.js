@@ -297,7 +297,7 @@ test("recovery fix: a recovered pending turn holds the agent queue at most turnQ
   ctx.gw.entries.push({ id: "rec-u", kind: "message", role: "user", clientNonce: nonce, content: "old", timestampMs: Date.now() });
   await ctx.state.setPromptContext(AGENT, nonce, { contextKey: nonce, clientNonce: nonce, origin: "whatsapp", chatId: GROUP, createdAt: Date.now() - 1_000, awaitingCompletion: true });
   const recovery = ctx.bridge.recoverPending();
-  await new Promise((r) => setTimeout(r, 20));
+  await waitFor(() => ctx.bridge.pendingRecovery.has(AGENT), 1_000, 2);
   assert.ok(ctx.bridge.pendingRecovery.has(AGENT));
   const waiting = [ctx.bridge.ingest(mention("one")), ctx.bridge.ingest(mention("two")), ctx.bridge.ingest(mention("three"))];
   await waitFor(() => ctx.gw.prompts.length === 1, 2_000);
