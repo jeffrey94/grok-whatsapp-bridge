@@ -137,6 +137,15 @@ function replyAfter(ctx, ms, text) {
   };
 }
 
+// Reply only once `predicate` holds (e.g. the holding line went out), so ordering does not
+// depend on wall-clock gaps between timers.
+function replyWhen(ctx, predicate, text) {
+  ctx.gw.onPrompt = () => {
+    ctx.gw.status = { isRunning: true, isRunningTurn: true, isComposingMessage: false };
+    waitFor(predicate, 3_000, 5).then(() => { ctx.gw.status = { isRunning: false, isRunningTurn: false, isComposingMessage: false }; ctx.gw.reply(text); });
+  };
+}
+
 // ---- 1) progress ----
 
 test("progress: composing is refreshed while the turn runs and stops (paused) on reply", async () => {
@@ -176,7 +185,7 @@ test("slowAck: off by default; on per group sends ONE holding line in the sender
   assert.deepEqual(off.transport.sent.map((s) => s.text), ["answer"]);
 
   const on = await setup({ extra: { slowAckMs: 30 }, groups: [{ jid: GROUP, name: "PJ Boys", agent: AGENT, slowAck: true }] });
-  replyAfter(on, 150, "答案");
+  replyWhen(on, () => on.transport.sent.length === 1, "答案");
   const msg = mention("这个多少钱？");
   await on.bridge.ingest(msg);
   assert.deepEqual(on.transport.sent.map((s) => s.text), ["稍等，我在处理中 🙏", "答案"]);

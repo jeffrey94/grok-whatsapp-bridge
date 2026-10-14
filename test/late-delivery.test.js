@@ -142,19 +142,25 @@ test("item 1+3: ack is delivered while the turn runs; turn ends when isRunningTu
 });
 
 test("item 1+3: several SendToUser messages stream out one by one in order", async () => {
+  // Deterministic: each later message is only produced after the previous one was delivered,
+  // so the test never depends on wall-clock gaps between replies (it used to flake under CI load).
   const ctx = await setup();
   ctx.gw.onPrompt = () => {
     ctx.gw.status = { isRunning: true, isRunningTurn: true };
-    setTimeout(() => ctx.gw.reply("one"), 10);
-    setTimeout(() => ctx.gw.reply("two"), 120);
-    setTimeout(() => { ctx.gw.reply("three"); ctx.gw.status = { isRunning: false, isRunningTurn: false }; }, 240);
+    ctx.gw.reply("one");
   };
   const done = ctx.bridge.handleEvent(mention("go"));
   await waitFor(() => ctx.transport.sent.length === 1);
   assert.deepEqual(texts(ctx), ["one"], "first message went out before the others existed");
+  ctx.gw.reply("two");
+  await waitFor(() => ctx.transport.sent.length === 2);
+  assert.deepEqual(texts(ctx), ["one", "two"], "second message streamed out while the turn was still running");
+  ctx.gw.reply("three");
+  ctx.gw.status = { isRunning: false, isRunningTurn: false };
   await done;
   assert.deepEqual(texts(ctx), ["one", "two", "three"]);
   assert.equal(ctx.transport.sent[1].quoted, undefined, "only the first part is quoted");
+  assert.equal(ctx.transport.sent[2].quoted, undefined, "only the first part is quoted");
 });
 
 test("item 1: legacy gateway (no isRunningTurn) timing out still delivers the ack, sends no error notice, and later messages are forwarded", async () => {
